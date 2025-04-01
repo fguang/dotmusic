@@ -81,6 +81,8 @@ class OnsetDetectorApp(QMainWindow):
         # --- 初始状态栏消息 ---
         self.statusBar().showMessage("准备就绪") # Set initial status bar message after setup
 
+        # self.follow_playback_checkbox = QCheckBox("Follow Playback") # REMOVED - Now created in setupUi
+        # ... 然后将这个 checkbox 添加到你的布局中 ...
 
     def _connect_signals(self):
         """Connects UI element signals to slots."""
@@ -195,6 +197,9 @@ class OnsetDetectorApp(QMainWindow):
          self._toggle_main_mute(True) # 确保初始未静音
          self._toggle_click_mute(True) # 确保初始未静音
          self.export_button.setEnabled(False)
+         # --- ADDED: Reset follow checkbox ---
+         self.follow_playback_checkbox.setEnabled(False)
+         # --- END ADDED ---
          self.status_label.setText("")
          self.file_label.setText("尚未选择文件") # 重置文件标签
          self.statusBar().showMessage("准备就绪")
@@ -217,24 +222,25 @@ class OnsetDetectorApp(QMainWindow):
             # 启用控件
             self.detect_button.setEnabled(True)
             self.play_main_checkbox.setEnabled(True) # 启用主音轨切换
+            # --- ADDED: Enable follow checkbox ---
+            # Enable it here, actual playback readiness depends on duration signal
+            self.follow_playback_checkbox.setEnabled(True)
+            # --- END ADDED ---
 
             # 更新波形图（现在从 handler 获取数据）
             self.update_waveform_plot()
             # 准备主音轨源（现在从 handler 获取数据）
             self._prepare_main_audio_source()
 
-            # 加载后自动开始检测
-            QTimer.singleShot(10, self.run_onset_detection)
-
         else:
             error_msg = f"加载音频时出错: {file_path}"
             print(error_msg, file=sys.stderr)
-            self.file_label.setText(f"加载失败:\n{file_path}")
+            self.file_label.setText(f"加载失败:\\n{file_path}")
             self.statusBar().showMessage("音频加载失败")
             # 显示错误消息给用户
-            QMessageBox.critical(self, "错误", f"无法加载音频文件:\n{file_path}")
+            QMessageBox.critical(self, "错误", f"无法加载音频文件:\\n{file_path}")
             # 确保状态完全重置
-            self._reset_state_for_new_file()
+            self._reset_state_for_new_file() # This will disable follow checkbox
 
 
     def update_waveform_plot(self):
@@ -273,6 +279,9 @@ class OnsetDetectorApp(QMainWindow):
         self.export_button.setEnabled(False)
         self.play_clicks_checkbox.setEnabled(False)
         self.play_main_checkbox.setEnabled(False)
+        # --- ADDED: Disable follow checkbox ---
+        self.follow_playback_checkbox.setEnabled(False)
+        # --- END ADDED ---
         # Temporarily disable playback controls during detection
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
@@ -310,6 +319,10 @@ class OnsetDetectorApp(QMainWindow):
             self.play_clicks_checkbox.setEnabled(True)
             self.play_main_checkbox.setEnabled(True)
             self.export_button.setEnabled(True)
+            # --- ADDED: Re-enable follow checkbox if playback possible ---
+            if self.media_player.duration() > 0:
+                self.follow_playback_checkbox.setEnabled(True)
+            # --- END ADDED ---
              # Only re-enable playback if duration is valid
             if self.media_player.duration() > 0:
                  self.play_pause_button.setEnabled(True)
@@ -328,6 +341,9 @@ class OnsetDetectorApp(QMainWindow):
              self.click_player.setSource(QUrl())
              self._cleanup_temp_file('temp_click_file_path')
              self.play_clicks_checkbox.setEnabled(False)
+             # --- Ensure follow checkbox is disabled on error ---
+             self.follow_playback_checkbox.setEnabled(False)
+             # ---
         finally:
              self.detect_button.setEnabled(True) # Always re-enable detection button
 
@@ -506,23 +522,95 @@ class OnsetDetectorApp(QMainWindow):
 
     @Slot(int)
     def _update_position(self, position):
-        """Updates the seek slider and time label based on main player position."""
+        """Updates the seek slider, time label, playback line, and optionally pans the view."""
         if not self.is_seeking: # Only update slider if user isn't dragging it
-             # Prevent setting value beyond max during natural playback end
-             max_val = self.seek_slider.maximum()
-             if position <= max_val:
-                  self.seek_slider.setValue(position)
-             else: # Handle reaching the end
-                  self.seek_slider.setValue(max_val)
+            max_val = self.seek_slider.maximum()
+            # Prevent setting value beyond max during natural playback end
+            if position <= max_val:
+                 self.seek_slider.setValue(position)
+            else: # Handle reaching the end
+                 self.seek_slider.setValue(max_val)
 
         duration = self.media_player.duration()
         # Ensure duration is positive before formatting time
         valid_duration = duration if duration > 0 else 0
         self.time_label.setText(f"{self._format_time(position)} / {self._format_time(valid_duration)}")
 
-        if self.playback_position_line:
-            self.playback_position_line.setPos(position / 1000.0)
+        current_time_sec = position / 1000.0
 
+        # --- 添加: 跟随播放逻辑 ---
+        # 假设你有一个名为 follow_playback_checkbox 的 QCheckBox
+        follow_checkbox = getattr(self, 'follow_playback_checkbox', None)
+        # 检查复选框是否存在且被选中，并且播放器正在播放且用户没有在拖动滑块
+        if (follow_checkbox and follow_checkbox.isChecked() and
+                not self.is_seeking and
+                self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+
+            view_duration = self.view_duration_spinbox.value() # 获取当前视图宽度（秒）
+            view_box = self.plot_widget.getViewBox()
+            current_range = view_box.viewRange()[0] # 获取当前视图的 X 轴范围 [start, end]
+            view_start, view_end = current_range
+
+            # --- Get Total Duration --- (Ensure it's valid before proceeding)
+            total_duration_sec = self.audio_handler.get_duration()
+            if total_duration_sec is None or total_duration_sec <= 0:
+                print("Warning: Could not get valid total audio duration for follow playback.", file=sys.stderr)
+                # Optionally, update the playback line position even if scrolling fails
+                if self.playback_position_line:
+                    self.playback_position_line.setPos(current_time_sec)
+                return # Cannot calculate scroll without duration
+
+            # --- Follow Playback Logic --- CHANGE: Handle out-of-view cases
+            # print(f"Follow check: time={current_time_sec:.3f}, view=[{view_start:.3f}, {view_end:.3f}], duration={view_duration:.3f}, total_dur={total_duration_sec:.3f}") # DEBUG
+            new_view_start = view_start # Default to current view
+            new_view_end = view_end
+            needs_update = False
+
+            if current_time_sec < view_start:
+                # Case 1: Playhead is before the current view -> Center the view
+                # print(f"Follow Case 1: Before view") # DEBUG
+                # print(f"Playhead ({current_time_sec:.2f}s) before view [{view_start:.2f}s, {view_end:.2f}s]. Centering view.")
+                new_view_start = max(0.0, current_time_sec - view_duration / 2.0)
+                new_view_end = min(total_duration_sec, new_view_start + view_duration)
+                new_view_start = max(0.0, new_view_end - view_duration) # Adjust start based on clamped end
+                needs_update = True
+            elif current_time_sec >= view_end:
+                # Case 2: Playhead is at or after the current view end -> Page scroll
+                # print(f"Follow Case 2: At/After view end") # DEBUG
+                # Prevent scrolling if playhead is already at the very end of the audio
+                if view_end < total_duration_sec: # Only scroll if the current view doesn't already reach the end
+                    # print(f"Playhead ({current_time_sec:.2f}s) reached/passed view end [{view_end:.2f}s]. Paging scroll.")
+                    # print(f"Follow Case 2a: Paging scroll needed") # DEBUG
+                    new_view_start = view_end # Start the new view where the old one ended
+                    new_view_end = min(total_duration_sec, new_view_start + view_duration)
+                    new_view_start = max(0.0, new_view_end - view_duration) # Adjust start based on clamped end
+                    needs_update = True
+                # else:
+                     # print(f"Follow Case 2b: Already at end, no scroll") # DEBUG
+                # else: playhead is at or beyond the end, or view already includes the end, no need to scroll further
+            # else:
+                 # print(f"Follow Case 3: Inside view, no scroll needed") # DEBUG
+            # Case 3: view_start <= current_time_sec < view_end -> Playhead is inside, do nothing (needs_update is False)
+
+            # --- Apply new view range if needed ---
+            if needs_update:
+                 # Optional: Check if the change is significant enough to avoid tiny adjustments
+                 # (This might be less relevant now as jumps/pages should be significant)
+                 if abs(new_view_start - view_start) > 0.001 or abs(new_view_end - view_end) > 0.001:
+                     # print(f"Updating X range to: [{new_view_start:.2f}, {new_view_end:.2f}]")
+                     # print(f"Follow Applying update: New range=[{new_view_start:.3f}, {new_view_end:.3f}]") # DEBUG
+                     self.plot_widget.setXRange(new_view_start, new_view_end, padding=0)
+                 # else:
+                     # print(f"Follow Skipping minor update (range change too small)") # DEBUG
+            # else:
+            #    print("Follow No update needed flag") # DEBUG
+
+        # --- 更新播放指示线位置 ---
+        # 确保在视图可能更新后再设置指示线位置
+        if self.playback_position_line:
+            # 使用 current_time_sec (秒) 来设置指示线的位置
+            self.playback_position_line.setPos(current_time_sec)
+        # --- 结束: 跟随播放逻辑 ---
 
     @Slot(int)
     def _update_duration(self, duration):
@@ -534,6 +622,9 @@ class OnsetDetectorApp(QMainWindow):
             # Only enable play if detection isn't running
             if self.detect_button.isEnabled(): # Check if detection finished
                  self.play_pause_button.setEnabled(True)
+                 # --- ADDED: Enable follow checkbox ---
+                 self.follow_playback_checkbox.setEnabled(True)
+                 # --- END ADDED ---
             # Update time label immediately
             current_pos = self.media_player.position()
             self.time_label.setText(f"{self._format_time(current_pos)} / {self._format_time(duration)}")
@@ -542,6 +633,9 @@ class OnsetDetectorApp(QMainWindow):
             self.seek_slider.setRange(0, 1) # Avoid division by zero etc.
             self.seek_slider.setEnabled(False)
             self.play_pause_button.setEnabled(False)
+            # --- ADDED: Disable follow checkbox ---
+            self.follow_playback_checkbox.setEnabled(False)
+            # --- END ADDED ---
             self.time_label.setText("00:00 / 00:00")
 
     @Slot(QMediaPlayer.PlaybackState)
@@ -641,7 +735,7 @@ class OnsetDetectorApp(QMainWindow):
          if error != QMediaPlayer.Error.NoError and error != QMediaPlayer.Error.ResourceError: # ResourceError happens on stop/source change
             print(f"Main Media Player Error ({error}): {error_string}", file=sys.stderr)
             QMessageBox.warning(self, "播放错误 (主轨道)", f"播放主音轨时发生错误:\n{error_string}")
-            self._reset_playback() # Reset playback UI on significant error
+            self._reset_playback() # Reset playback UI on significant error (this will disable follow checkbox via _reset_state)
 
     @Slot(QMediaPlayer.Error, str)
     def _handle_click_media_error(self, error, error_string):
@@ -807,7 +901,7 @@ class OnsetDetectorApp(QMainWindow):
             self.seek_slider.setValue(0)
             self.time_label.setText(f"00:00 / {self._format_time(0)}")
         else:
-             self._reset_playback() # Full reset if main source fails
+             self._reset_playback() # Full reset if main source fails (disables follow checkbox)
 
 
     def _prepare_click_audio_source(self):
@@ -824,6 +918,10 @@ class OnsetDetectorApp(QMainWindow):
                  print("Error: Cannot prepare click source without reference audio.")
                  self.play_clicks_checkbox.setEnabled(False)
                  self.play_clicks_checkbox.setChecked(False)
+                 # --- Ensure follow is consistent if main audio is loaded ---
+                 if not self.media_player.source().isValid():
+                      self.follow_playback_checkbox.setEnabled(False)
+                 # ---
                  return # 不能继续
 
         # 再次检查长度 (可能在 generate_click_track 中已修正, 但再次检查更安全)
@@ -847,6 +945,10 @@ class OnsetDetectorApp(QMainWindow):
              print("Disabling click track due to preparation error.")
              self.play_clicks_checkbox.setEnabled(False)
              self.play_clicks_checkbox.setChecked(False) # Uncheck it
+             # --- Ensure follow is consistent if main audio is loaded ---
+             if not self.media_player.source().isValid():
+                  self.follow_playback_checkbox.setEnabled(False)
+             # ---
 
 
 if __name__ == "__main__":

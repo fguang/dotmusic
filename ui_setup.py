@@ -93,11 +93,11 @@ class Ui_OnsetDetectorApp(object):
         MainWindow.delta_slider.setValue(int(0.05 * SLIDER_PRECISION))
         MainWindow.delta_spinbox = QDoubleSpinBox()
         MainWindow.delta_spinbox.setObjectName("delta_spinbox")
-        MainWindow.delta_spinbox.setRange(0.01, 1.0)
+        MainWindow.delta_spinbox.setRange(0.001, 1.0)
         MainWindow.delta_spinbox.setSingleStep(0.01)
-        MainWindow.delta_spinbox.setValue(0.05)
+        MainWindow.delta_spinbox.setValue(0.03)
         MainWindow.delta_spinbox.setDecimals(3)
-        MainWindow.delta_spinbox.setFixedWidth(70)
+        MainWindow.delta_spinbox.setFixedWidth(80)
         delta_input_layout.addWidget(MainWindow.delta_slider)
         delta_input_layout.addWidget(MainWindow.delta_spinbox)
         controls_layout.addLayout(delta_input_layout)
@@ -106,7 +106,7 @@ class Ui_OnsetDetectorApp(object):
         delta_tip.setStyleSheet("font-size: 9pt; color: gray;")
         controls_layout.addWidget(delta_tip)
 
-        MainWindow.detect_button = QPushButton("重新检测 Onsets")
+        MainWindow.detect_button = QPushButton("检测 Onsets")
         MainWindow.detect_button.setObjectName("detect_button")
         MainWindow.detect_button.setEnabled(False)
         controls_layout.addWidget(MainWindow.detect_button)
@@ -172,6 +172,14 @@ class Ui_OnsetDetectorApp(object):
         MainWindow.play_clicks_checkbox.setEnabled(False)
         controls_layout.addWidget(MainWindow.play_main_checkbox)
         controls_layout.addWidget(MainWindow.play_clicks_checkbox)
+
+        # --- ADDED: Follow Playback Checkbox ---
+        MainWindow.follow_playback_checkbox = QCheckBox("跟随播放")
+        MainWindow.follow_playback_checkbox.setObjectName("follow_playback_checkbox")
+        MainWindow.follow_playback_checkbox.setChecked(True) # Default to on
+        MainWindow.follow_playback_checkbox.setEnabled(False) # Initially disabled, enable when playback is possible
+        controls_layout.addWidget(MainWindow.follow_playback_checkbox)
+        # --- END ADDED ---
 
         # Add Seek Slider and Time Label
         seek_layout = QHBoxLayout()

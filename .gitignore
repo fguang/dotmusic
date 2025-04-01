@@ -13,3 +13,6 @@ __pycache__/
 
 # Python scripts (user requested ignore)
 .DS_Store
+dist/
+build/
+*.spec
