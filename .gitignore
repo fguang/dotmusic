@@ -1,0 +1,15 @@
+# Generated files
+*.png
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+*.m4b
+*.m4p
+
+# Python cache
+__pycache__/
+
+# Python scripts (user requested ignore)
+.DS_Store
