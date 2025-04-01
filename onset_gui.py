@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                              QPushButton, QFileDialog, QHBoxLayout, QMessageBox,
                              QLabel, QDoubleSpinBox, QSpacerItem, QSizePolicy, QFrame,
                              QSlider, QCheckBox, QMenu)
-from PySide6.QtCore import Qt, Slot, QTimer, QUrl # ADDED QUrl
+from PySide6.QtCore import Qt, Slot, QTimer, QUrl, QObject, Signal, QThread # ADDED QThread, Signal, QObject
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput # ADDED QtMultimedia imports
 
 # --- Constants ---
@@ -26,6 +26,44 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput # ADDED QtMultimedia
 pg.setConfigOptions(antialias=True)
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
+
+# --- Audio Loading Worker ---
+class AudioLoaderWorker(QObject):
+    # Signal emitted when loading finishes: sends file path, loaded y data, and sr
+    finished = Signal(str, object, int)
+    # Signal emitted on error: sends file path and the exception object
+    error = Signal(str, object)
+
+    def __init__(self, audio_handler, file_path):
+        super().__init__()
+        self.audio_handler = audio_handler # Use the main app's handler instance
+        self.file_path = file_path
+        self.is_cancelled = False
+
+    @Slot()
+    def run(self):
+        """Loads the audio file using the audio handler."""
+        try:
+            print(f"Worker thread started for: {self.file_path}")
+            # Call the modified load_audio which now returns data or raises error
+            y, sr = self.audio_handler.load_audio(self.file_path)
+            # Check if cancelled during loading
+            if self.is_cancelled:
+                 print(f"Worker thread cancelled for: {self.file_path}")
+                 self.error.emit(self.file_path, "加载被取消") # Emit specific error or just return
+                 return
+            # Emit success signal with the loaded data
+            self.finished.emit(self.file_path, y, sr)
+            print(f"Worker thread finished successfully for: {self.file_path}")
+        except Exception as e:
+            print(f"Worker thread encountered error for {self.file_path}: {e}", file=sys.stderr)
+            if not self.is_cancelled: # Don't emit error if cancelled
+                 self.error.emit(self.file_path, e) # Emit error signal with exception
+
+    def cancel(self):
+        print(f"Cancelling worker thread for: {self.file_path}")
+        self.is_cancelled = True
+
 
 # --- Main Application Window ---
 class OnsetDetectorApp(QMainWindow):
@@ -49,7 +87,7 @@ class OnsetDetectorApp(QMainWindow):
         # --- Onset 和 Click 数据 ---
         self.onset_times = np.array([]) # Store detected onset times
         self.clicks_audio = None # Generated click track audio data (float32)
-        self.clicks_audio_int16 = None # Click track as int16 for WAV playback
+        # REMOVED: self.clicks_audio_int16 = None # Click track as int16 for WAV playback (will be generated on demand)
 
         # --- 音频播放状态 ---
         # playback_position_line is created in setupUi
@@ -67,6 +105,10 @@ class OnsetDetectorApp(QMainWindow):
         self.is_seeking = False # Flag to prevent feedback loop during slider seek
         self.was_playing_before_seek = False # Remember state before seeking
 
+        # --- 添加 QThread 相关属性 ---
+        self.load_thread = None
+        self.load_worker = None
+
         # --- 设置 UI ---
         Ui_OnsetDetectorApp().setupUi(self) # 调用从 ui_setup.py 导入的 UI 设置方法
         # self._init_ui() # Remove call to the old method
@@ -80,6 +122,10 @@ class OnsetDetectorApp(QMainWindow):
 
         # --- 初始状态栏消息 ---
         self.statusBar().showMessage("准备就绪") # Set initial status bar message after setup
+
+        # --- 新增：尝试预初始化音频后端 ---
+        self._try_preload_audio_backend()
+        # --- 结束新增 ---
 
         # self.follow_playback_checkbox = QCheckBox("Follow Playback") # REMOVED - Now created in setupUi
         # ... 然后将这个 checkbox 添加到你的布局中 ...
@@ -129,13 +175,132 @@ class OnsetDetectorApp(QMainWindow):
     def open_file_dialog(self):
         filename, _ = QFileDialog.getOpenFileName(self, "选择音频文件", ".", "Audio Files (*.wav *.mp3 *.aac *.flac)")
         if filename:
+            # --- 取消正在进行的加载 (如果存在) ---
+            if self.load_thread is not None and self.load_thread.isRunning():
+                 print("检测到正在进行的加载，尝试取消...")
+                 if self.load_worker:
+                     self.load_worker.cancel()
+                 # 等待线程优雅退出 (可选，但推荐)
+                 # self.load_thread.quit()
+                 # self.load_thread.wait(500) # 等待最多 500ms
+                 # 或者强制终止 (不推荐，可能导致资源问题)
+                 # self.load_thread.terminate()
+                 # self.load_thread.wait()
+                 print("旧加载线程已取消/终止。")
+                 # 重置线程和 worker 引用
+                 self.load_thread = None
+                 self.load_worker = None
+
             self._reset_playback() # 清理之前的播放状态
-            self.file_label.setText(f"加载中:\n{filename}") # Show filename immediately
-            self.statusBar().showMessage("正在加载音频...")
-            self._reset_state_for_new_file() # 清理旧数据（现在会调用 audio_handler.reset）
-            QApplication.processEvents()
-            # 使用 QTimer 异步调用新的加载方法
-            QTimer.singleShot(50, lambda: self.load_audio_via_handler(filename))
+            self._reset_state_for_new_file() # 清理旧数据和 UI 状态
+
+            self.file_label.setText(f"开始加载: {filename}") # Show filename immediately
+            self.statusBar().showMessage(f"正在后台加载音频: {os.path.basename(filename)}...")
+            self.detect_button.setEnabled(False) # 禁用检测直到加载完成
+            self.play_pause_button.setEnabled(False) # 禁用播放
+            self.seek_slider.setEnabled(False)
+            self.play_main_checkbox.setEnabled(False)
+            self.play_clicks_checkbox.setEnabled(False)
+            self.export_button.setEnabled(False)
+            self.follow_playback_checkbox.setEnabled(False)
+            QApplication.processEvents() # 确保 UI 更新
+
+            # --- 启动后台线程加载 ---
+            self.load_thread = QThread(self)
+            self.load_worker = AudioLoaderWorker(self.audio_handler, filename)
+            self.load_worker.moveToThread(self.load_thread)
+
+            # 连接信号槽
+            self.load_worker.finished.connect(self._audio_load_finished)
+            self.load_worker.error.connect(self._audio_load_error)
+            self.load_thread.started.connect(self.load_worker.run)
+            # 清理: 线程结束后删除 worker 和 thread 对象
+            self.load_thread.finished.connect(self.load_worker.deleteLater)
+            self.load_thread.finished.connect(self.load_thread.deleteLater)
+            # 重置引用，以便下次检查
+            self.load_thread.finished.connect(self._reset_thread_refs)
+
+            print("启动加载线程...")
+            self.load_thread.start()
+
+    # --- 新增：槽函数，用于重置线程引用 ---
+    @Slot()
+    def _reset_thread_refs(self):
+        print("加载线程已完成，重置引用。")
+        self.load_thread = None
+        self.load_worker = None
+
+
+    # --- 新增：处理音频加载完成的槽函数 ---
+    @Slot(str, object, int)
+    def _audio_load_finished(self, file_path, y_data, sr_data):
+        """在主线程中处理加载完成的音频数据。"""
+        print(f"主线程收到加载完成信号: {file_path}")
+
+        # 检查收到的文件路径是否是当前请求的路径（防止旧线程的延迟信号）
+        # 注意：这里简化处理，假设最后一个启动的线程是有效的
+        # 在复杂场景下，可能需要更严格的检查
+
+        # 更新 AudioHandler 实例的数据
+        self.audio_handler.audio_file_path = file_path
+        self.audio_handler.y = y_data
+        self.audio_handler.sr = sr_data
+        # 创建时间轴 (现在在这里创建)
+        self.audio_handler.time_axis = np.arange(len(y_data)) / sr_data
+        print(f"AudioHandler 实例更新完成: SR={sr_data}, Samples={len(y_data)}")
+
+
+        # 更新 UI
+        loaded_path = self.audio_handler.get_file_path() # 从 handler 获取最终路径
+        self.file_label.setText(f"已加载: {loaded_path}")
+        self.statusBar().showMessage("音频加载完成，准备检测 Onsets")
+
+        # 启用控件
+        self.detect_button.setEnabled(True)
+        self.play_main_checkbox.setEnabled(True)
+        self.follow_playback_checkbox.setEnabled(True) # 启用跟随 (播放是否可用取决于 prepare)
+
+        # 更新波形图
+        self.update_waveform_plot() # 使用 handler 中的新数据
+
+        # 准备主音轨源 (现在会触发 int16 转换)
+        # 准备音频源也可能耗时，虽然通常比加载快，但如果需要，也可移至线程
+        print("开始准备主音轨...")
+        QApplication.processEvents() # 让UI有机会更新
+        success = self._prepare_main_audio_source() # 这个函数内部会调用 get_playback_data
+        if success:
+            print("主音轨准备成功。")
+            # 播放按钮和滑块的启用现在由 _update_duration 控制，它会在 prepare 成功后被触发
+        else:
+            print("主音轨准备失败。")
+            self.statusBar().showMessage("音频加载完成，但准备播放失败")
+            # 保持播放相关控件禁用状态
+
+
+    # --- 新增：处理音频加载错误的槽函数 ---
+    @Slot(str, object)
+    def _audio_load_error(self, file_path, error):
+        """在主线程中处理加载过程中发生的错误。"""
+        print(f"主线程收到加载错误信号: {file_path}, Error: {error}")
+
+        # 检查是否是当前文件加载出错
+        # (简化处理，同上)
+
+        # Corrected f-string
+        error_msg = f"加载音频时出错: {file_path}, 错误详情: {error}"
+        print(error_msg, file=sys.stderr)
+        self.file_label.setText(f"加载失败: {file_path}")
+        self.statusBar().showMessage(f"音频加载失败: {os.path.basename(file_path)}")
+
+        # 显示错误消息给用户
+        if isinstance(error, str) and error == "加载被取消":
+             QMessageBox.information(self, "操作取消", f"音频文件加载已取消: {file_path}")
+        else:
+             QMessageBox.critical(self, "加载错误", f"无法加载音频文件:\n{file_path}\n\n{error}")
+
+        # 确保状态完全重置 (按钮等在 open_file_dialog 开始时已禁用)
+        self._reset_state_for_new_file() # 确保清理
+
 
     def _cleanup_temp_file(self, file_path_attr):
         """Safely cleans up a temporary file path stored in an attribute."""
@@ -187,7 +352,7 @@ class OnsetDetectorApp(QMainWindow):
          self.audio_handler.reset()
          # --- 清理 Onset 和 Click 数据 ---
          # REMOVED direct reset of audio data: self.y = None; self.y_int16 = None; self.sr = None; self.time_axis = None
-         self.onset_times = np.array([]); self.clicks_audio = None; self.clicks_audio_int16 = None
+         self.onset_times = np.array([]); self.clicks_audio = None; # REMOVED: self.clicks_audio_int16 = None
          # --- 重置 UI 元素 ---
          self.waveform_item.setData([], [])
          self.onset_scatter_item.setData([], [])
@@ -205,57 +370,22 @@ class OnsetDetectorApp(QMainWindow):
          self.statusBar().showMessage("准备就绪")
 
 
-    # RENAMED/REPLACED load_audio with load_audio_via_handler
-    def load_audio_via_handler(self, file_path):
-        """Loads audio using AudioHandler and updates UI accordingly."""
-        if not file_path: return
-
-        load_successful = self.audio_handler.load_audio(file_path)
-
-        if load_successful:
-            # 使用 audio_handler 获取文件路径
-            loaded_path = self.audio_handler.get_file_path()
-            print(f"音频加载成功: {loaded_path}")
-            self.file_label.setText(f"已加载:\n{loaded_path}")
-            self.statusBar().showMessage("音频加载完成，准备检测 Onsets")
-
-            # 启用控件
-            self.detect_button.setEnabled(True)
-            self.play_main_checkbox.setEnabled(True) # 启用主音轨切换
-            # --- ADDED: Enable follow checkbox ---
-            # Enable it here, actual playback readiness depends on duration signal
-            self.follow_playback_checkbox.setEnabled(True)
-            # --- END ADDED ---
-
-            # 更新波形图（现在从 handler 获取数据）
-            self.update_waveform_plot()
-            # 准备主音轨源（现在从 handler 获取数据）
-            self._prepare_main_audio_source()
-
-        else:
-            error_msg = f"加载音频时出错: {file_path}"
-            print(error_msg, file=sys.stderr)
-            self.file_label.setText(f"加载失败:\\n{file_path}")
-            self.statusBar().showMessage("音频加载失败")
-            # 显示错误消息给用户
-            QMessageBox.critical(self, "错误", f"无法加载音频文件:\\n{file_path}")
-            # 确保状态完全重置
-            self._reset_state_for_new_file() # This will disable follow checkbox
-
-
     def update_waveform_plot(self):
-        # 从 AudioHandler 获取波形数据
+        # 从 AudioHandler 获取波形数据 (现在是 unnormalized float32)
         time_axis, y = self.audio_handler.get_waveform_data()
         # 检查数据是否存在且有效
         if y is not None and time_axis is not None and len(time_axis) > 0:
             print("正在更新波形图...")
             self.waveform_item.setData(time_axis, y)
-            # 自动调整 Y 轴范围，然后禁用它以允许用户缩放
+
+            # 调整 Y 轴范围 (可能需要手动调整或保留之前的逻辑)
+            # 由于数据未归一化，自动范围可能更合适，或者需要用户手动缩放
             self.plot_widget.enableAutoRange(axis=pg.ViewBox.YAxis)
             self.plot_widget.autoRange()
-            # 使用 QTimer 延迟禁用自动范围，确保在渲染后执行
-            QTimer.singleShot(0, lambda: self.plot_widget.disableAutoRange(axis=pg.ViewBox.YAxis))
-            print("波形图更新完毕，Y 轴范围已固定。")
+            # 如果希望加载后固定范围，可以在 autoRange 后禁用
+            # QTimer.singleShot(0, lambda: self.plot_widget.disableAutoRange(axis=pg.ViewBox.YAxis))
+            print("波形图更新完毕。")
+
             # 更新 X 轴范围以匹配视图持续时间设置
             self._update_plot_x_range()
         else:
@@ -335,7 +465,7 @@ class OnsetDetectorApp(QMainWindow):
              self.statusBar().showMessage("Onset 检测失败")
              QMessageBox.warning(self, "检测错误", f"Onset 检测过程中发生错误:\n{e}")
              self.onset_times = np.array([])
-             self.clicks_audio = None; self.clicks_audio_int16 = None
+             self.clicks_audio = None; # REMOVED: self.clicks_audio_int16 = None
              self.onset_scatter_item.setData([], [])
              # Ensure click source is cleared if generation failed
              self.click_player.setSource(QUrl())
@@ -349,17 +479,20 @@ class OnsetDetectorApp(QMainWindow):
 
 
     def update_onset_markers(self):
-        # 从 handler 获取 float32 的 y 用于定位标记
+        # 从 handler 获取 float32 的 y 用于定位标记 (现在是未归一化的)
         _, y_float = self.audio_handler.get_waveform_data()
 
-        if y_float is None:
+        if y_float is None or len(y_float) == 0: # Add length check
              self.onset_scatter_item.setData([], [])
              return
 
         if self.onset_times.size > 0:
-            # 使用 float 波形的最大绝对值来缩放标记位置
+            # 使用未归一化波形的最大绝对值来缩放标记位置
             y_max = np.max(np.abs(y_float)) if len(y_float) > 0 else 1.0
             marker_y_position = y_max * 1.05 # 定位在波形上方一点
+            # 处理 y_max 可能为 0 的情况
+            if abs(marker_y_position) < 1e-6: marker_y_position = 0.1 # Or some small default height
+
             scatter_data = [{'pos': (t, marker_y_position), 'data': t} for t in self.onset_times]
             self.onset_scatter_item.setData(scatter_data)
             print(f"更新了 {len(self.onset_times)} 个 Onset 标记。")
@@ -368,15 +501,16 @@ class OnsetDetectorApp(QMainWindow):
             print("没有 Onset 标记可更新。")
 
     def generate_click_track(self):
-        """Generates float32 click track and converts to int16."""
-        # 从 AudioHandler 获取参考数据
-        y_ref, sr_ref = self.audio_handler.get_detection_data() # float32 y
-        y_int16_ref, _ = self.audio_handler.get_playback_data() # int16 y
+        """Generates float32 click track (unnormalized)."""
+        # 从 AudioHandler 获取参考数据 (float32 y unnormalized, sr)
+        y_ref, sr_ref = self.audio_handler.get_detection_data()
 
-        if y_ref is None or sr_ref is None or y_int16_ref is None: # 需要参考音频长度和采样率
+        # REMOVED y_int16_ref check here, not needed for generation
+
+        if y_ref is None or sr_ref is None: # 需要参考音频长度和采样率
             print("无法生成打点音轨：缺少参考音频数据。")
             self.clicks_audio = None
-            self.clicks_audio_int16 = None
+            # self.clicks_audio_int16 = None # Removed
             return
 
         print("正在生成打点声音...")
@@ -384,7 +518,7 @@ class OnsetDetectorApp(QMainWindow):
         click_duration_sec = 0.03
         click_frames = int(click_duration_sec * sr_ref) # 使用 handler 的 sr
         click_times_rel = np.arange(click_frames) / sr_ref # 使用 handler 的 sr
-        # 生成 [-0.6, 0.6] 范围内的 float32 点击信号
+        # 生成点击信号，幅度可以根据需要调整，这里保持 0.6
         click_signal = (0.6 * np.sin(2 * np.pi * click_freq * click_times_rel)).astype(np.float32)
 
         # 使用 handler 的 y 创建 float32 零数组
@@ -402,27 +536,12 @@ class OnsetDetectorApp(QMainWindow):
                      signal_part = click_signal[:len_to_add]
                      # Add click signal to the float32 array
                      self.clicks_audio[start:end] += signal_part
-            # Optional: Normalize float clicks track if needed (max should be ~0.6 here)
-            # max_click_abs = np.max(np.abs(self.clicks_audio))
-            # if max_click_abs > 1.0:
-            #     self.clicks_audio /= max_click_abs
-            #     print("Normalized click track.")
 
-        # 转换最终的 float32 clicks_audio 为 int16 用于播放
-        print("Converting click audio to int16 for WAV playback.")
-        self.clicks_audio_int16 = (self.clicks_audio * 32767).astype(np.int16)
-        # 确保长度与 int16 参考音频一致 (可能由于舍入误差)
-        if len(self.clicks_audio_int16) != len(y_int16_ref):
-             target_len = len(y_int16_ref)
-             current_len = len(self.clicks_audio_int16)
-             print(f"Warning: Generated int16 click track length ({current_len}) differs from reference ({target_len}). Adjusting.")
-             if target_len > current_len:
-                 self.clicks_audio_int16 = np.pad(self.clicks_audio_int16, (0, target_len - current_len))
-             elif target_len < current_len:
-                 self.clicks_audio_int16 = self.clicks_audio_int16[:target_len]
+        # --- 移除了在这里转换为 int16 的步骤 ---
+        # print("Converting click audio to int16 for WAV playback.")
+        # self.clicks_audio_int16 = ... (转换逻辑移到 _prepare_click_audio_source)
 
-
-        print("打点声音生成完毕 (float32 and int16)。")
+        print("打点声音生成完毕 (float32)。")
 
 
     # --- Slider/SpinBox Sync and View Update Slots ---
@@ -783,13 +902,22 @@ class OnsetDetectorApp(QMainWindow):
              print("No onsets to export.")
              return
 
+        # --- 获取当前音频文件目录作为默认导出目录 ---
+        default_dir = "." # 默认为当前工作目录
+        current_audio_path = self.audio_handler.get_file_path()
+        if current_audio_path and os.path.exists(os.path.dirname(current_audio_path)): # Check if path exists
+            default_dir = os.path.dirname(current_audio_path)
+        # --- 结束获取默认目录 ---
+
         onsets_to_export = self.onset_times
         default_suffix = f".{format}"
         file_filter = f"文本文件 (*.{format})" if format == 'txt' else f"CSV 文件 (*.{format})"
-        default_filename = "onsets_export"
+        default_filename_base = "onsets_export" # 基础文件名
 
         if visible_only:
-            if self.time_axis is None or len(self.time_axis) == 0:
+            # 从 handler 获取时间轴 (需要确保 audio_handler 已加载)
+            time_axis, _ = self.audio_handler.get_waveform_data() # Get data from handler
+            if time_axis is None or len(time_axis) == 0: # Check handler data validity
                  QMessageBox.information(self, "无视图", "无法确定当前视图范围。")
                  return
             current_x_range = self.plot_widget.getViewBox().viewRange()[0]
@@ -797,21 +925,24 @@ class OnsetDetectorApp(QMainWindow):
             onsets_to_export = self.onset_times[
                 (self.onset_times >= view_start) & (self.onset_times <= view_end)
             ]
-            default_filename = f"onsets_view_{view_start:.1f}s_to_{view_end:.1f}s"
+            # 修改默认文件名逻辑
+            default_filename_base = f"onsets_view_{view_start:.1f}s_to_{view_end:.1f}s"
             print(f"Exporting {len(onsets_to_export)} visible onsets in range [{view_start:.2f}, {view_end:.2f}]")
             if onsets_to_export.size == 0:
                  QMessageBox.information(self, "无可见数据", "当前视图范围内没有检测到的 Onset 点。")
                  return
         else:
              print(f"Exporting all {len(onsets_to_export)} onsets.")
-             default_filename = "onsets_all"
+             default_filename_base = "onsets_all" # 基础文件名
 
-        # Add format suffix
-        default_filename += default_suffix
+        # 组合完整默认文件名 (不含路径)
+        default_filename = default_filename_base + default_suffix
 
-        # Get save path
+        # Get save path - 使用获取到的 default_dir
+        # 将 default_dir 和 default_filename 结合，作为getSaveFileName的第三个参数
+        default_save_path = os.path.join(default_dir, default_filename)
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "保存 Onset 时间", default_filename, file_filter
+            self, "保存 Onset 时间", default_save_path, file_filter # Pass the combined path here
         )
 
         if save_path:
@@ -843,16 +974,33 @@ class OnsetDetectorApp(QMainWindow):
 
     # --- Audio Source Preparation ---
 
-    def _prepare_audio_source(self, player, audio_data_int16, sample_rate, temp_file_path_attr, description):
-        """Generic function to prepare and set audio source for a player."""
-        # sample_rate is now required
+    def _prepare_audio_source(self, player, get_data_func, temp_file_path_attr, description):
+        """
+        Generic function to prepare and set audio source for a player.
+        Uses a function to get the int16 data and sample rate on demand.
+        """
+        print(f"准备 {description} 音频源...")
+        # 调用提供的函数来获取 int16 数据和采样率
+        audio_data_int16, sample_rate = get_data_func()
+
         if audio_data_int16 is None or sample_rate is None:
-            print(f"Cannot prepare {description} source: Missing data or sample rate.")
-            player.setSource(QUrl()) # 清除源（如果数据缺失）
+            print(f"无法准备 {description} 源: 获取数据失败。")
+            player.setSource(QUrl()) # 清除源
             self._cleanup_temp_file(temp_file_path_attr) # 清理旧文件
+            # 在主音轨失败时也禁用播放按钮和滑块
+            if description == "main":
+                 self.play_pause_button.setEnabled(False)
+                 self.seek_slider.setEnabled(False)
+                 self.follow_playback_checkbox.setEnabled(False) # Disable follow if main fails
+            elif description == "click":
+                 self.play_clicks_checkbox.setEnabled(False) # Disable click check if it fails
+
             return False
 
-        print(f"Preparing {description} audio source (SR={sample_rate})...")
+        print(f"获取到 {description} 的 int16 数据 (SR={sample_rate}), Samples={len(audio_data_int16)}")
+        print(f"开始写入临时 WAV 文件: {temp_file_path_attr}")
+        # --- UI 更新移到外面 ---
+        # QApplication.processEvents()
 
         # Stop player before changing source
         player.stop()
@@ -869,90 +1017,143 @@ class OnsetDetectorApp(QMainWindow):
             # Write int16 data using soundfile, providing sample_rate
             soundfile.write(temp_file_path, audio_data_int16, sample_rate, format='WAV', subtype='PCM_16')
             temp_file.close() # Close the handle, file persists because delete=False
-            print(f"Temporary {description} audio written to: {temp_file_path}")
+            print(f"临时 {description} 音频写入到: {temp_file_path}")
 
             # Set the new source for the media player
             player.setSource(QUrl.fromLocalFile(temp_file_path))
-            print(f"{description} source set successfully.")
+            print(f"{description} source 设置成功。")
             return True
 
         except Exception as e:
-            print(f"Error preparing {description} audio source: {e}", file=sys.stderr)
-            QMessageBox.critical(self, "音频错误", f"准备{description}音轨源时出错:\n{e}")
+            print(f"准备 {description} 音频源时出错: {e}", file=sys.stderr)
+            QMessageBox.critical(self, "音频错误", f"准备{description}音轨源时出错: {e}")
             # Clean up the file if creation failed mid-way
             if temp_file:
                  temp_file.close() # Close handle first
             self._cleanup_temp_file(temp_file_path_attr) # Attempt removal
             player.setSource(QUrl()) # Ensure source is cleared
+             # 在主音轨失败时也禁用播放按钮和滑块
+            if description == "main":
+                 self.play_pause_button.setEnabled(False)
+                 self.seek_slider.setEnabled(False)
+                 self.follow_playback_checkbox.setEnabled(False) # Disable follow if main fails
+            elif description == "click":
+                 self.play_clicks_checkbox.setEnabled(False) # Disable click check if it fails
             return False
 
 
     def _prepare_main_audio_source(self):
         """Prepares the main audio track using the generic function."""
-        # 从 AudioHandler 获取播放数据 (int16 y, sr)
-        y_play, sr_play = self.audio_handler.get_playback_data()
+        # 传递获取数据的函数给通用准备函数
         success = self._prepare_audio_source(self.media_player,
-                                           y_play, # Pass int16 data
-                                           sr_play, # Pass sample rate
+                                           self.audio_handler.get_playback_data, # Pass the method itself
                                            'temp_audio_file_path',
                                            "main")
         if success:
-            # Reset position visually after setting source, duration comes later via signal
-            self.seek_slider.setValue(0)
-            self.time_label.setText(f"00:00 / {self._format_time(0)}")
+            # QMediaPlayer 会在源设置后异步发出 durationChanged 信号
+            # 不需要在这里手动重置 UI，等待信号处理函数 _update_duration
+            pass
         else:
-             self._reset_playback() # Full reset if main source fails (disables follow checkbox)
+             # 失败处理已在 _prepare_audio_source 内部完成 (禁用按钮等)
+             self._reset_playback() # 也可以选择完全重置
+        return success # 返回成功状态
 
 
     def _prepare_click_audio_source(self):
         """Prepares the click track audio using the generic function."""
-        # 获取用于参考长度和采样率的 handler 数据
-        y_int16_ref, sr_ref = self.audio_handler.get_playback_data()
+        # 获取用于参考长度和采样率的 handler 数据 (float32)
+        y_ref, sr_ref = self.audio_handler.get_detection_data()
 
-        # 检查 click 音轨 int16 数据是否存在且与参考长度匹配
-        if self.clicks_audio_int16 is None:
-             if y_int16_ref is not None:
-                 print("Warning: Click track int16 data missing, creating zeros.")
-                 self.clicks_audio_int16 = np.zeros_like(y_int16_ref, dtype=np.int16)
-             else:
-                 print("Error: Cannot prepare click source without reference audio.")
-                 self.play_clicks_checkbox.setEnabled(False)
-                 self.play_clicks_checkbox.setChecked(False)
-                 # --- Ensure follow is consistent if main audio is loaded ---
-                 if not self.media_player.source().isValid():
-                      self.follow_playback_checkbox.setEnabled(False)
-                 # ---
-                 return # 不能继续
+        # 检查 click 音轨 float32 数据是否存在
+        if self.clicks_audio is None:
+             print("错误: 无法准备 click source，click audio 数据未生成。")
+             self.play_clicks_checkbox.setEnabled(False)
+             self.play_clicks_checkbox.setChecked(False)
+             return False # 不能继续
 
-        # 再次检查长度 (可能在 generate_click_track 中已修正, 但再次检查更安全)
-        if y_int16_ref is not None and len(self.clicks_audio_int16) != len(y_int16_ref):
-             print("Warning: Click track int16 length mismatch before prepare, padding/truncating.")
-             target_len = len(y_int16_ref)
-             current_len = len(self.clicks_audio_int16)
-             if target_len > current_len:
-                self.clicks_audio_int16 = np.pad(self.clicks_audio_int16, (0, target_len - current_len))
-             elif target_len < current_len:
-                self.clicks_audio_int16 = self.clicks_audio_int16[:target_len]
+        # 定义一个内部函数来获取点击音轨的 int16 数据
+        def get_click_playback_data():
+            if self.clicks_audio is None or sr_ref is None:
+                 return None, None
 
-        # 使用 handler 的 sr
+            print("转换 click 音频为 int16 用于 WAV 播放。")
+            clicks_float = self.clicks_audio
+            # --- 使用与主音轨相同的方法进行缩放 ---
+            max_abs = np.max(np.abs(clicks_float))
+            clicks_int16 = None
+            if max_abs > 1e-6:
+                 clicks_scaled = clicks_float / max_abs
+                 # 注意：这里的缩放基于 click 信号自身的最大值，
+                 # 如果希望 click 音量相对于主音轨固定，可能需要不同的策略
+                 clicks_int16 = (clicks_scaled * 32767 * 0.6).astype(np.int16) # 乘以 0.6 降低音量
+            else:
+                 clicks_int16 = np.zeros_like(clicks_float, dtype=np.int16)
+
+            # 确保长度与参考音频一致 (如果需要)
+            if y_ref is not None and len(clicks_int16) != len(y_ref):
+                 print(f"Warning: Generated int16 click track length ({len(clicks_int16)}) differs from reference ({len(y_ref)}). Adjusting.")
+                 target_len = len(y_ref)
+                 current_len = len(clicks_int16)
+                 if target_len > current_len:
+                     clicks_int16 = np.pad(clicks_int16, (0, target_len - current_len))
+                 elif target_len < current_len:
+                     clicks_int16 = clicks_int16[:target_len]
+
+            return clicks_int16, sr_ref # 使用参考采样率
+
+        # 使用通用函数和上面定义的获取函数
         success = self._prepare_audio_source(self.click_player,
-                                           self.clicks_audio_int16, # Pass int16 click data
-                                           sr_ref, # Pass sample rate from handler
+                                           get_click_playback_data, # Pass the inner function
                                            'temp_click_file_path',
                                            "click")
         if not success:
-             # Don't do a full reset, just disable the click track UI
-             print("Disabling click track due to preparation error.")
+             print("禁用 click 音轨，因为准备失败。")
              self.play_clicks_checkbox.setEnabled(False)
              self.play_clicks_checkbox.setChecked(False) # Uncheck it
-             # --- Ensure follow is consistent if main audio is loaded ---
-             if not self.media_player.source().isValid():
-                  self.follow_playback_checkbox.setEnabled(False)
-             # ---
+        return success
+
+    # --- 新增：预初始化方法 ---
+    def _try_preload_audio_backend(self):
+        """
+        Attempts to load a tiny silent audio array to trigger
+        initialization of the audio backend (like soundfile).
+        This might help prevent crashes on the *first* real file open
+        if the issue is related to backend initialization in certain environments.
+        """
+        print("尝试预初始化音频后端...")
+        try:
+            # 创建一个非常短的静音 NumPy 数组 (例如 10 个采样点)
+            sample_rate = 22050 # 使用一个常见的采样率
+            silent_audio = np.zeros(10, dtype=np.float32)
+
+            # 使用 soundfile 尝试将其写入临时文件并立即删除
+            # 这会强制 soundfile 加载其底层库 (如 libsndfile)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_f:
+                soundfile.write(temp_f.name, silent_audio, sample_rate)
+            print("音频后端预初始化尝试成功。")
+            # 可选：可以尝试用 librosa 加载一下，进一步确保
+            # librosa.load(temp_f.name) # 因为 delete=True，这行会失败，但或许上面的 write 就够了
+            # 或者更简单地调用一个 librosa 函数看看是否报错
+            _ = librosa.get_duration(y=silent_audio, sr=sample_rate)
+            print("Librosa 功能初步检查通过。")
+
+        except Exception as e:
+            # 如果预初始化失败，打印警告但不要让程序崩溃
+            # 用户在实际打开文件时仍然可能会遇到问题
+            print(f"警告：预初始化音频后端时发生错误: {e}", file=sys.stderr)
+            # 可以选择弹出一个非阻塞的消息提示用户潜在问题
+            # QMessageBox.warning(self, "初始化警告", f"尝试初始化音频系统时出错:\n{e}\n\n后续音频加载可能失败。")
+        print("预初始化流程结束。")
+    # --- 结束新增 ---
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = OnsetDetectorApp()
+    # --- 将 _try_preload_audio_backend 调用移到 __init__ 中 ---
+    # # 尝试在显示窗口前进行预加载
+    # print("Attempting audio backend preload before showing window...")
+    # window._try_preload_audio_backend() # REMOVED from here
+    # print("Preload attempt finished.")
     window.show()
     sys.exit(app.exec()) 
