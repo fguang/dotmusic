@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Audio Onset Detection & Visualization Tool / 音频 Onset 检测与可视化工具
+
+This is the main GUI application for detecting onset points in audio files.
+Run this file to start the application.
+
+这是用于检测音频文件中起音点的主要GUI应用程序。
+运行此文件以启动应用程序。
+
+Usage / 使用方法:
+    python onset_gui.py
+"""
+
 import sys
 import numpy as np
 import librosa
