@@ -10,6 +10,9 @@
 
 # Python cache
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 
 # Python scripts (user requested ignore)
 .DS_Store
