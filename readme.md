@@ -1,6 +1,8 @@
-# 音频 Onset 检测与可视化工具
+# 音频 Onset 检测与可视化工具 / Audio Onset Detection & Visualization Tool
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> **English Summary**: This is a practical tool for music and audio analysis that helps automatically detect "onset points" in audio files. It features a GUI application with real-time waveform visualization, supports multiple audio formats, and provides beat detection capabilities for music analysis, education, and audio editing.
 
 这是一个专门用于音乐和音频分析的实用工具，可以帮助您自动检测音频中的"起音点"（onset）。
 
@@ -30,20 +32,47 @@
 - 播放进度跟随功能
 - 主音轨和打点音轨独立音量开关
 
-## 安装要求
+## 安装要求 / Installation Requirements
 
+**系统要求 / System Requirements:**
 - Python 3.7+
-- PySide6
-- NumPy
-- librosa
-- pyqtgraph
-- soundfile
 
-可以通过以下命令安装依赖:
+**依赖库 / Dependencies:**
+- PySide6 (GUI framework)
+- NumPy (numerical computing)
+- librosa (audio processing)
+- pyqtgraph (data visualization)
+- soundfile (audio file I/O)
 
+**安装方法 / Installation:**
+
+使用 requirements.txt 安装所有依赖 / Install all dependencies using requirements.txt:
+```bash
+pip install -r requirements.txt
+```
+
+或者手动安装每个依赖 / Or install dependencies manually:
 ```bash
 pip install PySide6 numpy librosa pyqtgraph soundfile
 ```
+
+## 快速开始 / Quick Start
+
+1. **安装依赖 / Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **启动应用 / Launch application:**
+   ```bash
+   python onset_gui.py
+   ```
+
+3. **使用步骤 / Usage steps:**
+   - 点击"打开文件"选择音频文件 / Click "Open File" to select an audio file
+   - 调整参数进行 onset 检测 / Adjust parameters for onset detection
+   - 播放音频并查看可视化结果 / Play audio and view visualization results
+   - 导出检测结果 / Export detection results
 
 ## 使用方法
 
